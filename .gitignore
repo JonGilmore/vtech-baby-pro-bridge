@@ -1,0 +1,21 @@
+# Ignore everything
+*
+
+!README.md
+!.gitignore
+
+!extract_license_key.sh
+!extract_license_offsets.py
+!extract_password_offsets.py
+!extract_password.sh
+!.env.example
+
+!bridge/
+!bridge/vtech_native.c
+!bridge/docker/
+!bridge/docker/Dockerfile
+!bridge/docker/build-context.sh
+!bridge/docker/entrypoint.sh
+!bridge/docker/vtech-bridge.sh
+!bridge/docker/dnsmasq.conf
+!bridge/docker/go2rtc.yaml

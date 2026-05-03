@@ -1,0 +1,15 @@
+api:
+  listen: ":1984"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555/tcp"
+
+log:
+  level: info
+
+streams:
+  vtech_baby:
+    - "exec:/usr/local/bin/vtech-bridge.sh#input=h264#killsignal=SIGTERM#killtimeout=5"
