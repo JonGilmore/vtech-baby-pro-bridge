@@ -343,7 +343,69 @@ int main(int argc, char **argv) {
   if (rc < 0)
     DIE("IOTC_sCHL_initialize failed");
 
-  /* 4) Get a session slot + connect */
+  /* 4) Get a session slot + connect.
+   *
+   * Before the connect we do an `IOTC_Lan_Search` broadcast on the
+   * local subnet. This is what discovers the camera over UDP without
+   * needing TUTK's cloud master server to track the camera's current
+   * IP. The side-effect we care about is that the SDK populates its
+   * internal device cache from the broadcast replies, so the
+   * subsequent `IOTC_Connect_ByUID_Parallel` call uses the LAN-direct
+   * path immediately instead of waiting on (and being misled by) the
+   * cloud master's stale "device not listening" response. This makes
+   * the bridge work on isolated networks where the camera has no
+   * internet — just LAN reachability between Pi and camera.
+   *
+   * stLanSearchInfo layout (from TUTK SDK 4.x headers): UID[24] +
+   * IP[16] + Port:u16 + DeviceName[64] + Reserved[64] = 168 bytes per
+   * entry. We allocate generously (8 entries × 256 B) to be tolerant
+   * of small per-version layout drift.
+   *
+   * VTECH_LAN_SEARCH_MS env var lets you tune the broadcast wait
+   * window; default 3s is fine for most networks. Set to 0 to skip
+   * Lan_Search entirely (pre-fix behavior — useful for debugging).
+   *
+   * Port: TUTK changed the default LAN-search broadcast port from
+   * 32761 (older SDK) to 32762 (newer SDK). This camera's firmware
+   * listens on 32762 — confirmed by pcap of the official app. The
+   * SDK we're loading defaults to 32761, so we explicitly set it
+   * via IOTC_Set_LanSearchPort before the search. Override with
+   * VTECH_LAN_SEARCH_PORT if you need a different port. */
+  typedef int (*set_lan_port_fn)(unsigned short);
+  set_lan_port_fn set_lan_port = (set_lan_port_fn)dlsym(libIOTC, "IOTC_Set_LanSearchPort");
+  unsigned short lan_port = getenv("VTECH_LAN_SEARCH_PORT")
+    ? (unsigned short)atoi(getenv("VTECH_LAN_SEARCH_PORT"))
+    : 32762;
+  if (set_lan_port) {
+    int rc_port = set_lan_port(lan_port);
+    LOG("IOTC_Set_LanSearchPort(%u) = %d", lan_port, rc_port);
+  } else {
+    LOG("IOTC_Set_LanSearchPort not in libIOTCAPIs.so — using SDK default port");
+  }
+
+  typedef int (*lan_search_fn)(void *, int, int);
+  lan_search_fn lan_search = (lan_search_fn)dlsym(libIOTC, "IOTC_Lan_Search");
+  int lan_ms = getenv("VTECH_LAN_SEARCH_MS") ? atoi(getenv("VTECH_LAN_SEARCH_MS")) : 3000;
+  if (lan_search && lan_ms > 0) {
+    char results[8 * 256] = {0};
+    int found = lan_search(results, 8, lan_ms);
+    LOG("IOTC_Lan_Search = %d device(s) on LAN (%dms scan)", found, lan_ms);
+    /* Dump UID + IP of any discovered devices (UID is the first 20 ASCII
+     * bytes of each 168-byte entry, IP is at offset 24). */
+    for (int i = 0; i < found && i < 8; i++) {
+      const char *entry = results + i * 168;
+      char uid_buf[21] = {0};
+      char ip_buf[17] = {0};
+      memcpy(uid_buf, entry, 20);
+      memcpy(ip_buf, entry + 24, 16);
+      LOG("  [%d] UID=%s IP=%s", i, uid_buf, ip_buf);
+    }
+  } else if (!lan_search) {
+    LOG("IOTC_Lan_Search not in libIOTCAPIs.so — skipping LAN scan");
+  } else {
+    LOG("IOTC_Lan_Search skipped (VTECH_LAN_SEARCH_MS=0)");
+  }
+
   int sid = get_sid();
   LOG("IOTC_Get_SessionID = %d", sid);
 
@@ -667,13 +729,19 @@ int main(int argc, char **argv) {
       LOG("frame#%d codec=%u in=%d out=%d (dec=%d pass=%d fail=%d)", frames,
           codec, rc, out_len, decrypted, passthrough, decrypt_fail);
     }
-    /* Decrypted real-video frames already begin with an Annex-B start
-     * code; banner-mode passthrough frames don't. Prepend only if needed
-     * (go2rtc rejects double start codes). */
     static const unsigned char prefix[4] = {0, 0, 0, 1};
-    if (out_len < 4 || memcmp(out_buf, prefix, 4) != 0)
+    if (out_len >= 4 && out_buf[0] == 0 && out_buf[1] == 0 && out_buf[2] == 0) {
+      if (out_buf[3] == 1) {
+        /* Annex-B already, write as-is */
+        fwrite(out_buf, 1, out_len, stdout);
+      } else {
+        fwrite(prefix, 1, 4, stdout);
+        fwrite(out_buf + 4, 1, out_len - 4, stdout);
+      }
+    } else {
       fwrite(prefix, 1, 4, stdout);
-    fwrite(out_buf, 1, out_len, stdout);
+      fwrite(out_buf, 1, out_len, stdout);
+    }
     fflush(stdout);
   }
   LOG("totals: frames=%d  decrypted=%d  passthrough=%d  decrypt_fail=%d  "
