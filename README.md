@@ -7,6 +7,7 @@ The camera uses ThroughTek's TUTK/Kalay P2P with an X25519 + ChaCha20-Poly1305 a
 ## Status: working end-to-end
 
 - Real video at **1920×1080 @ 15 fps** decoded
+- **Audio** (G.711 A-law, 8 kHz mono) decrypted, transcoded to AAC, and muxed into the RTSP stream
 - **LOCAL ONLY**
 - Live in Frigate via go2rtc
 - Containerized for ARM64 Linux
@@ -226,6 +227,26 @@ docker exec vtech-bridge ffprobe rtsp://localhost:8554/vtech_baby 2>&1 | grep -E
 | [`extract_uid_offsets.py`](extract_uid_offsets.py)           | Computes the offset for `IOTC_Connect_ByUID_Parallel` to capture the camera's TUTK UID. Useful if the camera-info screen in the app isn't accessible or you want ground-truth from the SDK. |
 | [`extract_uid.sh`](extract_uid.sh)                           | Runs on a rooted Android device. Hooks `IOTC_Connect_ByUID_Parallel`, prints the UID. Same camera-live-view trigger as the password extractor. |
 | [`.env.example`](.env.example)                               | Template for camera UID / password / license-key path. Copy to `.env` and fill in.                                                |
+
+## Audio
+
+The bridge drains audio off the same TUTK AV session as video (TUTK splits them into separate FIFOs internally; the bridge runs `avRecvAudioData` on its own thread). Frames are encrypted with the same ChaCha20-Poly1305 PRK as video and are decrypted in-place with the same `decrypt_frame()` path.
+
+The wire codec is **G.711 A-law @ 8 kHz mono** (TUTK reports codec id `0x8a`, which is nominally µ-law in the SDK header — VTech actually puts A-law there). MPEG-TS doesn't natively carry G.711, so the wrapper script transcodes audio to AAC LC (48 kbps mono) inside an ffmpeg subprocess and muxes both tracks into a single MPEG-TS stream that go2rtc consumes.
+
+Override the assumed codec at `docker run` time if A-law sounds wrong on your firmware:
+
+```sh
+docker run ... -e VTECH_AUDIO_CODEC=mulaw ...     # default is alaw
+```
+
+To turn audio off entirely (back to a raw H.264-only stream — useful for bisecting if the muxed path regresses):
+
+```sh
+docker run ... -e VTECH_DISABLE_AUDIO=1 ...
+```
+
+You'll then also need to flip `#input=mpegts` back to `#input=h264` in `bridge/docker/go2rtc.yaml`.
 
 ## Notes on the camera password
 

@@ -9,7 +9,11 @@ webrtc:
 
 log:
   level: info
+  exec: warn       # quiet exec source stderr at runtime; flip to "trace" to debug
 
 streams:
   vtech_baby:
-    - "exec:/usr/local/bin/vtech-bridge.sh#input=h264#killsignal=SIGTERM#killtimeout=5"
+    # Wrapper outputs MPEG-TS containing H.264 video + G.711µ audio.
+    # (Set VTECH_DISABLE_AUDIO=1 in the container env to fall back to raw
+    # H.264; you'll then need #input=h264 here.)
+    - "exec:/usr/local/bin/vtech-bridge.sh#input=mpegts#killsignal=SIGTERM#killtimeout=5"
