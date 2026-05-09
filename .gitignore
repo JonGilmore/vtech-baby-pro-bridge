@@ -8,6 +8,8 @@
 !extract_license_offsets.py
 !extract_password_offsets.py
 !extract_password.sh
+!extract_uid_offsets.py
+!extract_uid.sh
 !.env.example
 
 !bridge/

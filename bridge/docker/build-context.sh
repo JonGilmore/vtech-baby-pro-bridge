@@ -7,7 +7,11 @@
 #   ../device_apk_libs/lib{TUTKGlobalAPIs,IOTCAPIs,AVAPIs,sodium}.so   (patched)
 #   ../bridge/vtech_native                                              (NDK-built)
 #   ../bridge/libdnsfix.so                                              (optional)
-#   /tmp/bionic-rootfs.tar.gz   OR   /root/bionic-rootfs/   (the chroot tree)
+#   ~/bionic-rootfs.tar.gz      OR   ~/bionic-rootfs/        (the chroot tree;
+#                                                              we avoid /tmp by
+#                                                              default since
+#                                                              tmpfs clears on
+#                                                              reboot)
 #
 # Output:
 #   ./rootfs/   - the chroot tree, ready to COPY into the image
@@ -17,8 +21,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 REPO=$(cd ../..; pwd)
-ROOTFS_TARBALL=${ROOTFS_TARBALL:-/tmp/bionic-rootfs.tar.gz}
-ROOTFS_DIR=${ROOTFS_DIR:-/root/bionic-rootfs}
+ROOTFS_TARBALL=${ROOTFS_TARBALL:-$HOME/bionic-rootfs.tar.gz}
+ROOTFS_DIR=${ROOTFS_DIR:-$HOME/bionic-rootfs}
 
 # 1. Lay down the chroot tree from either a tarball or an existing directory
 echo "[build-context] preparing rootfs/"

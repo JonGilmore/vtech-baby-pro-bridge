@@ -104,7 +104,21 @@ adb shell su -c '/data/local/tmp/extract_password.sh $(pm path com.cams.vtech.mv
 #     The captured password is on the last line; paste it into .env in
 #     the next step.
 
-# 2e) Extract the TUTK SDK shared libraries from the APK. The bridge
+# 2e) Extract your camera's TUTK UID. You can also just read it off the
+#     camera-info screen in the VTech app — but the uprobe path is
+#     consistent with 2a-2d and gives you ground truth for what the SDK
+#     actually sees. Hooks IOTC_Connect_ByUID_Parallel; first arg is the
+#     UID C-string. Same trigger as 2d (open camera live view). Skip
+#     this step if you already have the UID (it's hardware-derived and
+#     usually doesn't change when you re-pair on a different network).
+python3 extract_uid_offsets.py xapk/config.arm64_v8a.apk
+#     → prints something like 0x5fc74.
+
+adb push extract_uid.sh /data/local/tmp/
+adb shell su -c '/data/local/tmp/extract_uid.sh $(pm path com.cams.vtech.mvb.pro | grep arm64_v8a | sed s/^package://) 0x5fc74' | tee /tmp/vtech_uid.txt
+#     The UID is on the last line; paste it into .env in the next step.
+
+# 2f) Extract the TUTK SDK shared libraries from the APK. The bridge
 #     dlopens these at runtime; we don't redistribute them (proprietary
 #     ThroughTek code) — you have to pull them from your own APK. They
 #     live inside config.arm64_v8a.apk (Android per-arch splits are
@@ -170,11 +184,14 @@ rsync -av \
     ./ "$PI:vtech-baby-pro-bridge/"
 
 # Plus the bionic-rootfs tarball, which lives under /tmp/ (not in the repo)
-rsync -av /tmp/bionic-rootfs.tar.gz "$PI:/tmp/"
+# Stash the bionic-rootfs tarball under $HOME on the Pi (NOT /tmp, which
+# is tmpfs on most distros and clears on reboot — losing the tarball
+# silently breaks build-context.sh's next run).
+rsync -av /tmp/bionic-rootfs.tar.gz "$PI:bionic-rootfs.tar.gz"
 
 # 5) On the Pi: assemble build context, build the image, run the container.
 cd ~/vtech-baby-pro-bridge/bridge/docker
-ROOTFS_TARBALL=/tmp/bionic-rootfs.tar.gz ./build-context.sh
+ROOTFS_TARBALL=~/bionic-rootfs.tar.gz ./build-context.sh
 docker build -t vtech-bridge:latest .
 
 # 6) Source .env, then docker run with bind-mounted license-key file.
@@ -206,6 +223,8 @@ docker exec vtech-bridge ffprobe rtsp://localhost:8554/vtech_baby 2>&1 | grep -E
 | [`extract_license_key.sh`](extract_license_key.sh)           | Runs on a rooted Android device. Installs the uprobe, restarts the app, prints the captured license key.                          |
 | [`extract_password_offsets.py`](extract_password_offsets.py) | Same machinery, different lib + symbol — computes the offset for `avClientStartEx` to capture the per-camera AV-channel password. |
 | [`extract_password.sh`](extract_password.sh)                 | Runs on a rooted Android device. Hooks `avClientStartEx`, waits for you to open the camera live view, prints the password.        |
+| [`extract_uid_offsets.py`](extract_uid_offsets.py)           | Computes the offset for `IOTC_Connect_ByUID_Parallel` to capture the camera's TUTK UID. Useful if the camera-info screen in the app isn't accessible or you want ground-truth from the SDK. |
+| [`extract_uid.sh`](extract_uid.sh)                           | Runs on a rooted Android device. Hooks `IOTC_Connect_ByUID_Parallel`, prints the UID. Same camera-live-view trigger as the password extractor. |
 | [`.env.example`](.env.example)                               | Template for camera UID / password / license-key path. Copy to `.env` and fill in.                                                |
 
 ## Notes on the camera password
