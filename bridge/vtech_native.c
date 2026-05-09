@@ -109,6 +109,7 @@ typedef int (*av_send_ioctl_fn)(int, uint32_t, const char *, int);
 typedef int (*av_recv_ioctl_fn)(int, uint32_t *, char *, int, uint32_t);
 typedef int (*av_recv_frame2_fn)(int, char *, int, void *, void *, char *, int,
                                  uint32_t *, void *);
+typedef int (*av_recv_audio_fn)(int, char *, int, char *, int, unsigned int *);
 
 /* ---- libsodium typedefs ----
  * Standard libsodium signatures. We dlopen libsodium.so (pulled from the apk
@@ -230,6 +231,116 @@ static int decrypt_frame(crypto_ctx_t *cc, const uint8_t *frame, int frame_len,
   if (rc != 0)
     return -5; /* auth failed */
   return (int)pt_len;
+}
+
+/* ---- audio thread ----
+ *
+ * The camera sends audio on the same TUTK AV session as video. The SDK
+ * demuxes it into a separate FIFO that you drain via avRecvAudioData
+ * on its own thread. Audio frames are encrypted with the same
+ * ChaCha20-Poly1305 PRK as video, so decrypt_frame() is reused.
+ *
+ * Empirically (probe run on RM5766, 2026-05): codec=0x8a (G.711 µ-law),
+ * 8 kHz mono, 320B plaintext per 40 ms frame — matches one frame per
+ * RTSP packet in the standard PCM_MULAW pipeline.
+ *
+ * Modes:
+ *   - VTECH_AUDIO_FIFO=<path>     production: open the path for write,
+ *                                 stream decrypted G.711 plaintext to it
+ *                                 (forever, alongside the video loop).
+ *                                 vtech-bridge.sh wires this to ffmpeg
+ *                                 for MPEG-TS muxing into the RTSP feed.
+ *   - VTECH_AUDIO_PROBE_SEC=N     diagnostic: run for N seconds logging
+ *                                 codec/size/decrypt outcome to stderr.
+ *                                 Can be combined with VTECH_AUDIO_FIFO.
+ *   - VTECH_DISABLE_AUDIO=1       (handled in wrapper, not here)
+ */
+typedef struct {
+  int av;
+  av_recv_audio_fn recv_audio;
+  crypto_ctx_t *cc;
+  int duration_sec;     /* 0 = forever */
+  const char *out_path; /* NULL = no fifo output (probe-only) */
+  int log_first_n;      /* log first N frames to stderr (0 = none) */
+} audio_thread_ctx_t;
+
+static void *audio_thread_fn(void *arg) {
+  audio_thread_ctx_t *ctx = (audio_thread_ctx_t *)arg;
+  /* Generous buffers — VTech audio frames are 380B encrypted / 320B
+   * plaintext but other codecs (AAC) could be larger. 32K is paranoid-safe. */
+  char abuf[32 * 1024];
+  char ainfo[64];
+  uint8_t pt[32 * 1024];
+  unsigned int aidx = 0;
+  int got = 0, written = 0, dec_fail = 0, errs = 0, last_err = 0;
+  int last_codec = -1, last_size = -1;
+  time_t start = time(NULL);
+  /* Open the output fifo here (not on main thread) so the main thread can
+   * proceed to the video recv loop immediately. ffmpeg reads inputs in
+   * order — it won't open the audio fifo for read until it has video data
+   * from input #0, which it can't get until the bridge starts writing
+   * video. So opening the fifo here, after spawn, breaks the deadlock. */
+  FILE *out_fp = NULL;
+  if (ctx->out_path) {
+    LOG("audio: opening fifo %s for write (blocks until reader connects)",
+        ctx->out_path);
+    out_fp = fopen(ctx->out_path, "wb");
+    if (!out_fp) {
+      LOG("audio: fopen(%s) failed — audio thread exiting", ctx->out_path);
+      return NULL;
+    }
+  }
+  LOG("=== audio thread START (%s, fifo=%s) ===",
+      ctx->duration_sec == 0 ? "forever" : "timed", out_fp ? "open" : "none");
+  while (ctx->duration_sec == 0 || time(NULL) - start < ctx->duration_sec) {
+    int rc = ctx->recv_audio(ctx->av, abuf, sizeof(abuf), ainfo, sizeof(ainfo),
+                             &aidx);
+    if (rc < 0) {
+      if (rc != last_err) {
+        LOG("audio recv err=%d (0x%x)", rc, (unsigned)rc);
+        last_err = rc;
+      }
+      errs++;
+      usleep(20 * 1000);
+      continue;
+    }
+    got++;
+    /* TUTK FRAMEINFO_t (audio variant): u16 codec, u8 flags, u8 cam_idx,
+     * u8 online_num, u8 reserved[3], u32 reserved2, u32 timestamp.
+     * VTech RM5766: codec=0x8a G.711µ, flags=0x02 → 8 kHz mono. */
+    uint16_t codec = *(uint16_t *)ainfo;
+    uint8_t flags = (uint8_t)ainfo[2];
+    uint32_t ts = *(uint32_t *)(ainfo + 12);
+    int pt_len = -999; /* sentinel: not attempted */
+    if (ctx->cc->ready && rc >= 60) {
+      pt_len = decrypt_frame(ctx->cc, (uint8_t *)abuf, rc, pt, sizeof(pt));
+      if (pt_len < 0)
+        dec_fail++;
+    }
+    /* Production: write plaintext G.711 bytes to the fifo so ffmpeg can
+     * pick them up. Skip if decrypt failed or we're in passthrough range. */
+    if (pt_len > 0 && out_fp) {
+      if (fwrite(pt, 1, pt_len, out_fp) > 0) {
+        written++;
+        fflush(out_fp);
+      }
+    }
+    if (got <= ctx->log_first_n || codec != last_codec || rc != last_size) {
+      char hex[3 * 32 + 1] = {0};
+      int show = rc < 32 ? rc : 32;
+      for (int i = 0; i < show; i++)
+        snprintf(hex + i * 3, 4, "%02x ", (uint8_t)abuf[i]);
+      LOG("audio#%d codec=0x%02x flags=0x%02x ts=%u size=%d pt=%d  %s%s", got,
+          codec, flags, ts, rc, pt_len, hex, rc > 32 ? "..." : "");
+      last_codec = codec;
+      last_size = rc;
+    }
+  }
+  LOG("=== audio thread END  got=%d written=%d dec_fail=%d errs=%d ===", got,
+      written, dec_fail, errs);
+  if (out_fp)
+    fclose(out_fp);
+  return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -372,20 +483,25 @@ int main(int argc, char **argv) {
    * via IOTC_Set_LanSearchPort before the search. Override with
    * VTECH_LAN_SEARCH_PORT if you need a different port. */
   typedef int (*set_lan_port_fn)(unsigned short);
-  set_lan_port_fn set_lan_port = (set_lan_port_fn)dlsym(libIOTC, "IOTC_Set_LanSearchPort");
-  unsigned short lan_port = getenv("VTECH_LAN_SEARCH_PORT")
-    ? (unsigned short)atoi(getenv("VTECH_LAN_SEARCH_PORT"))
-    : 32762;
+  set_lan_port_fn set_lan_port =
+      (set_lan_port_fn)dlsym(libIOTC, "IOTC_Set_LanSearchPort");
+  unsigned short lan_port =
+      getenv("VTECH_LAN_SEARCH_PORT")
+          ? (unsigned short)atoi(getenv("VTECH_LAN_SEARCH_PORT"))
+          : 32762;
   if (set_lan_port) {
     int rc_port = set_lan_port(lan_port);
     LOG("IOTC_Set_LanSearchPort(%u) = %d", lan_port, rc_port);
   } else {
-    LOG("IOTC_Set_LanSearchPort not in libIOTCAPIs.so — using SDK default port");
+    LOG("IOTC_Set_LanSearchPort not in libIOTCAPIs.so — using SDK default "
+        "port");
   }
 
   typedef int (*lan_search_fn)(void *, int, int);
   lan_search_fn lan_search = (lan_search_fn)dlsym(libIOTC, "IOTC_Lan_Search");
-  int lan_ms = getenv("VTECH_LAN_SEARCH_MS") ? atoi(getenv("VTECH_LAN_SEARCH_MS")) : 3000;
+  int lan_ms = getenv("VTECH_LAN_SEARCH_MS")
+                   ? atoi(getenv("VTECH_LAN_SEARCH_MS"))
+                   : 3000;
   if (lan_search && lan_ms > 0) {
     char results[8 * 256] = {0};
     int found = lan_search(results, 8, lan_ms);
@@ -621,7 +737,7 @@ int main(int argc, char **argv) {
         {0x733, "VTECH_unknown_733", 4, 0},
         {0x7d6, "VTECH_unknown_7d6", 4, 0},
         {0x719, "VTECH_HD_TRIGGER", 8, 0}, /* HD live stream switch */
-        {0x300, "STREAM_START", 8, 0},
+        {0x300, "AUDIOSTART", 8, 0},       /* IPCAM_AUDIOSTART_REQ */
         {0x1ff, "IPCAM_START", 8, 0},
     };
     char buf16[16] = {0};
@@ -674,6 +790,43 @@ int main(int argc, char **argv) {
             n > 32 ? "..." : "");
       }
       LOG("=== drain done (saw %d IOCtrl responses) ===", seen);
+    }
+  }
+
+  /* 7d) Audio thread — drains avRecvAudioData and (in production mode)
+   * writes decrypted G.711 plaintext to a fifo for ffmpeg to mux. See
+   * audio_thread_fn comment for the env-var matrix. */
+  pthread_t audio_thread;
+  audio_thread_ctx_t actx = {0};
+  int audio_thread_started = 0;
+  {
+    const char *audio_fifo = getenv("VTECH_AUDIO_FIFO");
+    int audio_probe_sec = getenv("VTECH_AUDIO_PROBE_SEC")
+                              ? atoi(getenv("VTECH_AUDIO_PROBE_SEC"))
+                              : 0;
+    if (audio_fifo || audio_probe_sec > 0) {
+      av_recv_audio_fn recv_audio =
+          (av_recv_audio_fn)dlsym(libAV, "avRecvAudioData");
+      if (!recv_audio) {
+        LOG("avRecvAudioData not found in libAVAPIs — audio disabled");
+      } else {
+        actx.av = av;
+        actx.recv_audio = recv_audio;
+        actx.cc = &cc;
+        /* If a fifo is set we run forever; if probe-only, run for the
+         * configured probe duration. */
+        actx.duration_sec = audio_fifo ? 0 : audio_probe_sec;
+        actx.out_path = audio_fifo;
+        actx.log_first_n = audio_probe_sec > 0 ? 20 : 5;
+        /* The audio thread does its own fopen() on the fifo (which blocks
+         * until ffmpeg opens the read end). Doing it here on the main
+         * thread would deadlock with ffmpeg's serial input-open. */
+        if (pthread_create(&audio_thread, NULL, audio_thread_fn, &actx) != 0) {
+          LOG("audio pthread_create failed — audio disabled");
+        } else {
+          audio_thread_started = 1;
+        }
+      }
     }
   }
 
@@ -750,5 +903,7 @@ int main(int argc, char **argv) {
       (unsigned)last_err);
   free(buf);
   free(ptbuf);
+  if (audio_thread_started)
+    pthread_join(audio_thread, NULL);
   return 0;
 }
