@@ -248,6 +248,20 @@ docker run ... -e VTECH_DISABLE_AUDIO=1 ...
 
 You'll then also need to flip `#input=mpegts` back to `#input=h264` in `bridge/docker/go2rtc.yaml`.
 
+## Reconnects
+
+The camera's WiFi drops out now and then. go2rtc only reconnects when the source process exits — it never times out a source that is alive but silent — so the bridge makes sure it always exits when the stream is dead:
+
+- `vtech_native` exits as soon as the TUTK session reports it was closed or timed out, and a watchdog kills it if no video frame arrives in time.
+- `vtech-bridge.sh` supervises the bridge and ffmpeg; when either one exits, it stops the other and exits too.
+
+go2rtc then restarts the pipeline, and Frigate sees a short gap instead of a stream that stays dead until the container restarts. The watchdog timeouts are tunable at `docker run` time (`0` disables):
+
+```sh
+docker run ... -e VTECH_STARTUP_TIMEOUT_SEC=90 ...   # launch -> first frame (default 90)
+docker run ... -e VTECH_STALL_TIMEOUT_SEC=15 ...     # max gap between frames (default 15)
+```
+
 ## Notes on the camera password
 
 The VTech onboarding flow generates a per-camera AV-channel password (8 chars, mixed case + digits) during pairing — it is NOT the WiFi password or the parent-unit password. The cleanest way to retrieve it is the kernel-uprobe extractor in step 2c/2d above

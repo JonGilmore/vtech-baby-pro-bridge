@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +140,37 @@ typedef int (*crypto_aead_chacha20poly1305_ietf_decrypt_fn)(
     fprintf(stderr, "[bridge] FATAL: " fmt "\n", ##__VA_ARGS__);               \
     exit(1);                                                                   \
   } while (0)
+
+/* avRecvFrameData2 errors that mean the AV session is gone (AVAPIs.h).
+ * Everything else (-20012 DATA_NOREADY, -20013/-20014 lost/incomplete
+ * frame) is transient and just means "poll again". */
+#define AV_ER_INVALID_SID -20010
+#define AV_ER_SESSION_CLOSE_BY_REMOTE -20015
+#define AV_ER_REMOTE_TIMEOUT_DISCONNECT -20016
+
+/* ---- stall watchdog ----
+ *
+ * go2rtc's exec source waits forever for the first byte and never notices
+ * a source that goes quiet, so a bridge that hangs (camera dropped off
+ * WiFi, a TUTK call that never returns, stdout nobody reads) leaves the
+ * stream dead until the container restarts. One alarm() covers all of
+ * those: it's armed at startup, re-armed after every frame we write, and
+ * if it ever fires we exit non-zero. vtech-bridge.sh then tears down
+ * ffmpeg and go2rtc reconnects the producer.
+ *
+ *   VTECH_STARTUP_TIMEOUT_SEC  launch -> first frame     (default 90)
+ *   VTECH_STALL_TIMEOUT_SEC    max gap between frames    (default 15)
+ *
+ * 0 disables either. The TUTK libs leave SIGALRM at its default (checked
+ * via /proc/<pid>/status SigCgt on a live bridge), so we own it. */
+static void on_watchdog(int sig) {
+  (void)sig;
+  static const char msg[] =
+      "[bridge] FATAL: watchdog - no video frame within timeout\n";
+  ssize_t w = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  (void)w;
+  _exit(1);
+}
 
 static void *xdlopen(const char *path) {
   void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
@@ -358,6 +390,17 @@ int main(int argc, char **argv) {
   const char *uid = argv[1];
   const char *password = argv[2];
   int duration = (argc > 3) ? atoi(argv[3]) : 60; /* 0 = forever */
+
+  unsigned startup_timeout =
+      getenv("VTECH_STARTUP_TIMEOUT_SEC")
+          ? (unsigned)atoi(getenv("VTECH_STARTUP_TIMEOUT_SEC"))
+          : 90;
+  unsigned stall_timeout =
+      getenv("VTECH_STALL_TIMEOUT_SEC")
+          ? (unsigned)atoi(getenv("VTECH_STALL_TIMEOUT_SEC"))
+          : 15;
+  signal(SIGALRM, on_watchdog);
+  alarm(startup_timeout);
 
   const char *license_path = getenv("VTECH_LICENSE_KEY_FILE");
   if (!license_path || !*license_path) {
@@ -840,6 +883,7 @@ int main(int argc, char **argv) {
   int frames = 0, decrypted = 0, decrypt_fail = 0, passthrough = 0;
   int err_count = 0;
   int last_err = 0;
+  int session_lost = 0;
   time_t start = time(NULL);
   while (duration == 0 || time(NULL) - start < duration) {
     rc = recv_frame(av, buf, 5 * 1024 * 1024, NULL, NULL, info, 24, &idx,
@@ -849,6 +893,11 @@ int main(int argc, char **argv) {
       if (rc != last_err) {
         LOG("recv_frame err=%d (0x%x)", rc, (unsigned)rc);
         last_err = rc;
+      }
+      if (rc == AV_ER_INVALID_SID || rc == AV_ER_SESSION_CLOSE_BY_REMOTE ||
+          rc == AV_ER_REMOTE_TIMEOUT_DISCONNECT) {
+        session_lost = 1;
+        break;
       }
       usleep(20 * 1000);
       continue;
@@ -896,14 +945,24 @@ int main(int argc, char **argv) {
       fwrite(out_buf, 1, out_len, stdout);
     }
     fflush(stdout);
+    alarm(stall_timeout);
   }
+  alarm(0);
   LOG("totals: frames=%d  decrypted=%d  passthrough=%d  decrypt_fail=%d  "
       "err=%d  last_err=%d (0x%x)",
       frames, decrypted, passthrough, decrypt_fail, err_count, last_err,
       (unsigned)last_err);
+  if (session_lost) {
+    /* The audio thread is still polling the dead session, so don't join
+     * it - exit non-zero and let the wrapper/go2rtc reconnect. */
+    LOG("FATAL: AV session lost - exiting");
+    _exit(1);
+  }
   free(buf);
   free(ptbuf);
-  if (audio_thread_started)
+  /* A fifo-writing audio thread runs forever (duration_sec=0); joining it
+   * would hang a timed run. Only timed probe threads end on their own. */
+  if (audio_thread_started && actx.duration_sec > 0)
     pthread_join(audio_thread, NULL);
   return 0;
 }
