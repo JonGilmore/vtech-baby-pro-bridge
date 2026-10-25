@@ -12,6 +12,10 @@ for d in proc sys dev; do
     fi
 done
 
+# Drop fifos left by bridge runs that never cleaned up (the container's
+# writable layer survives restarts, so they pile up otherwise).
+rm -f "${ROOTFS}"/data/local/tmp/vtech_*.fifo
+
 echo "[entrypoint] starting dnsmasq on 127.0.0.1:53"
 # Run in foreground so we can capture failures, but background it from this
 # script so go2rtc gets PID 1.
